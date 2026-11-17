@@ -52,7 +52,7 @@
 
 1. 在 .14 上把 `https://github.com/mhemh/ekko-continue` 拉到本地目录（或 `git pull` 已克隆的目录）。
 2. 插件中心 → 本插件 → 更新 / 重新安装，选择同一目录；插件配置和信任状态会保留。
-3. 启用后查看插件日志，`ekko-continue: plugin activated` 的 data 中 `version` 应为 `1.1.1`。
+3. 启用后查看插件日志，`ekko-continue: plugin activated` 的 data 中 `version` 应为 `0.1.0`。
 
 ## 工作方式
 
@@ -72,8 +72,7 @@
 - 续跑是重新发送一条消息，模型上下文会继续增长；请依靠次数上限和退避控制成本。
 - 会话 socket 使用插件的激活身份建立，因此只有激活 Profile 的会话能拿到原始 error 文本；其他 Profile 的会话仍可续跑（发送时带上会话 Profile），但失败判定退回业务事件，只能识别通用失败。
 - 若实时连接建立失败，用户主动停止仍可依据 `chat.run.stopped` / `abort.completed` 取消续跑。
-- 1.1.0 已在 192.168.0.14 实测：用户停止不续跑、注入连接失败后会发送续跑提示。
-- 1.1.1 修复完成事件处理函数未返回 Promise 导致持久化 `finish_reason` 查询被中止的问题；单测覆盖，更新后需再确认“截断续跑”。
+- 0.1.0 已在 192.168.0.14 实测：用户停止不续跑、注入连接失败后发送续跑提示、正常完成不中止 `finish_reason` 查询。
 
 ## 开发
 
@@ -89,3 +88,34 @@ npm test
 - `server.mjs`：判定、调度、退避、活动记录、RPC。
 - `client.mjs`：设置页（状态卡片、活动表、计数表）。
 - `test/server.test.mjs`：单元测试。
+
+## 引用与致谢
+
+本插件的自动续跑行为参考并移植自 [weibaohui/dsh-continue](https://github.com/weibaohui/dsh-continue)，原项目采用 MIT License（Copyright (c) 2026 weibaohui）。
+
+本项目是针对 Ekko Studio Plugin SDK v1 的独立重写实现，与原项目及其作者无隶属关系。原项目的判定规则、冷却、指数退避和次数上限等设计是本项目的行为来源。
+
+## 许可证
+
+MIT License
+
+Copyright (c) 2026 mhemh
+Copyright (c) 2026 weibaohui（源自 dsh-continue 的部分）
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

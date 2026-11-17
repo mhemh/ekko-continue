@@ -1,7 +1,7 @@
 {
   "id": "ekko-continue",
   "name": "Ekko Continue 自动继续",
-  "version": "1.1.1",
+  "version": "0.1.0",
   "apiVersion": 1,
   "description": "会话运行失败或输出被截断后，按规则自动向同一会话发送续跑提示（默认“继续”）。内置 dsh-continue 的判定规则、冷却、指数退避与单会话次数上限，并提供活动记录页面。",
   "license": "MIT",
