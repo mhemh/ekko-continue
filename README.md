@@ -33,26 +33,9 @@
 | 退避上限 | 30000 ms | 单次等待上限 |
 | 备用模型 Provider / Model / API 模式 | 空 | 上下文溢出时切换；Provider 与 Model 同时填写才生效 |
 
-## 安装到 192.168.0.14:6060
+## 测试完成过的Agent
 
-插件文件必须位于 Studio 进程可读的服务器本地路径，安装动作需要**超级管理员交互登录**。
-
-1. 把整个 `ekko-continue-plugin` 目录复制到 Studio 所在机器，例如 `/opt/ekko-continue-plugin`。
-   - 原生部署：用 SCP / SMB / U 盘等方式复制。
-   - Docker 部署：`docker cp ekko-continue-plugin <容器名>:/opt/ekko-continue-plugin`，或把它放进已挂载的宿主机目录。
-2. 浏览器登录 `http://192.168.0.14:6060/`（超级管理员）。
-3. 打开 **插件中心** → 安装 → 选择**本地目录安装** → 填入服务器绝对路径（如 `/opt/ekko-continue-plugin`）。
-4. 信任该插件并授予 `events`、`api.read`、`api.write`、`ui` 权限，然后**启用**。
-5. 在插件中心打开本插件配置；在 **设置 → 自动继续** 查看活动记录和当前计数。
-
-> 本地目录安装只复制成品，不会在 Studio 启动时同步源码；修改源码后需重新安装或使用开发链接。
-> 要求 Studio 版本支持 Plugin SDK v1（0.8.x，清单 `apiVersion: 1`）。旧版本不会加载本插件。
-
-### 从 GitHub 更新已安装版本
-
-1. 在 .14 上把 `https://github.com/mhemh/ekko-continue` 拉到本地目录（或 `git pull` 已克隆的目录）。
-2. 插件中心 → 本插件 → 更新 / 重新安装，选择同一目录；插件配置和信任状态会保留。
-3. 启用后查看插件日志，`ekko-continue: plugin activated` 的 data 中 `version` 应为 `0.1.0`。
+Hermes， Deepseek Harness
 
 ## 工作方式
 
@@ -72,7 +55,7 @@
 - 续跑是重新发送一条消息，模型上下文会继续增长；请依靠次数上限和退避控制成本。
 - 会话 socket 使用插件的激活身份建立，因此只有激活 Profile 的会话能拿到原始 error 文本；其他 Profile 的会话仍可续跑（发送时带上会话 Profile），但失败判定退回业务事件，只能识别通用失败。
 - 若实时连接建立失败，用户主动停止仍可依据 `chat.run.stopped` / `abort.completed` 取消续跑。
-- 0.1.0 已在 192.168.0.14 实测：用户停止不续跑、注入连接失败后发送续跑提示、正常完成不中止 `finish_reason` 查询。
+- 0.1.0 已在 开发者本地部署的docker上 实测：用户停止不续跑、注入连接失败后发送续跑提示、正常完成不中止 `finish_reason` 查询。
 
 ## 开发
 
