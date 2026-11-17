@@ -78,7 +78,8 @@ async function emit(listeners, type, data, options = {}) {
   };
   const run = options.run ?? { identity: { userId: 7, profile: 'default' } };
   await listener(event, run);
-  await sleep(40);
+  // Deferred work is drained by the plugin pump, not by the event handler.
+  await sleep(280);
 }
 
 test('retryable failure sends the continue prompt', async (t) => {
@@ -144,6 +145,31 @@ test('normal completion resets the attempt counter', async (t) => {
   assert.equal(harness.runs.length, 2);
 });
 
+test('a scheduled continuation is cancelled by chat.run.stopped', async (t) => {
+  const harness = await setup({ backoffBaseMs: 2000, backoffMaxMs: 2000 });
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  await emit(harness.listeners, 'chat.run.failed', {
+    subject: { session_id: 's1' },
+    summary: 'timeout',
+  });
+  await emit(harness.listeners, 'chat.run.stopped', {
+    subject: { session_id: 's1' },
+  });
+  await sleep(280);
+  assert.equal(harness.runs.length, 0);
+});
+
+test('continuation runs with the session profile', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  await emit(harness.listeners, 'chat.run.failed', {
+    subject: { session_id: 's1' },
+    summary: 'timeout',
+  }, { run: { identity: { userId: 7, profile: 'work' } } });
+  assert.equal(harness.runs.length, 1);
+  assert.equal(harness.runs[0].options.profile, 'work');
+});
+
 test('duplicate business event ids are ignored', async (t) => {
   const harness = await setup();
   t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
@@ -193,9 +219,12 @@ test('disabled plugin does not run or record a continuation', async (t) => {
 
 async function connectSession(harness, sid = 's1') {
   await emit(harness.listeners, 'chat.run.started', { subject: { session_id: sid } });
-  const connection = [...harness.connections].reverse().find((item) => item.id === sid);
-  assert.ok(connection, 'expected a live session connection');
-  return connection;
+  for (let i = 0; i < 20; i += 1) {
+    const connection = [...harness.connections].reverse().find((item) => item.id === sid);
+    if (connection) return connection;
+    await sleep(50);
+  }
+  assert.fail('expected a live session connection');
 }
 
 test('socket failure text is used for the decision', async (t) => {
@@ -203,7 +232,7 @@ test('socket failure text is used for the decision', async (t) => {
   t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
   const connection = await connectSession(harness);
   connection.listener({ event: 'run.failed', session_id: 's1', error: '502 bad gateway' });
-  await sleep(40);
+  await sleep(280);
   assert.equal(harness.runs.length, 1);
 });
 
@@ -216,7 +245,19 @@ test('socket auth failure stops and suppresses the business fallback', async (t)
     subject: { session_id: 's1' },
     summary: 'run failed',
   });
-  await sleep(40);
+  await sleep(280);
+  assert.equal(harness.runs.length, 0);
+});
+
+test('socket abort suppresses the follow-up business failure', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  const connection = await connectSession(harness);
+  connection.listener({ event: 'abort.completed', session_id: 's1' });
+  await emit(harness.listeners, 'chat.run.failed', {
+    subject: { session_id: 's1' },
+    summary: 'run failed',
+  });
   assert.equal(harness.runs.length, 0);
 });
 
@@ -225,7 +266,7 @@ test('user cancelled runs are not continued', async (t) => {
   t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
   const connection = await connectSession(harness);
   connection.listener({ event: 'run.failed', session_id: 's1', error: 'Run canceled' });
-  await sleep(40);
+  await sleep(280);
   assert.equal(harness.runs.length, 0);
 });
 
@@ -241,7 +282,7 @@ test('queued-message interruptions are not continued', async (t) => {
     stop_reason: 'queue_insertion',
     queue_remaining: 1,
   });
-  await sleep(40);
+  await sleep(280);
   assert.equal(harness.runs.length, 0);
 });
 
@@ -250,7 +291,7 @@ test('socket truncated completion continues', async (t) => {
   t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
   const connection = await connectSession(harness);
   connection.listener({ event: 'run.completed', session_id: 's1', stop_reason: 'length' });
-  await sleep(40);
+  await sleep(280);
   assert.equal(harness.runs.length, 1);
 });
 
@@ -273,7 +314,7 @@ test('ekko-agent completions read truncation from the persisted message', async 
     run_id: 'run-1',
     output: 'partial answer',
   });
-  await sleep(80);
+  await sleep(320);
   assert.equal(harness.runs.length, 1);
   assert.equal(harness.runs[0].input, '继续');
 });
@@ -291,7 +332,7 @@ test('persisted stop finish_reason resets without continuing', async (t) => {
   });
   const connection = await connectSession(harness);
   connection.listener({ event: 'run.completed', session_id: 's1', message_id: 7, run_id: 'run-1' });
-  await sleep(80);
+  await sleep(320);
   assert.equal(harness.runs.length, 0);
 });
 
@@ -310,7 +351,7 @@ test('business completion falls back to the persisted finish_reason', async (t) 
     subject: { session_id: 's1', message_id: 9, run_id: 'run-9' },
     state: { finish_reason: 'stop' },
   });
-  await sleep(60);
+  await sleep(280);
   assert.equal(harness.runs.length, 1);
 });
 
@@ -319,7 +360,7 @@ test('replayed socket events are ignored', async (t) => {
   t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
   const connection = await connectSession(harness);
   connection.listener({ event: 'run.failed', session_id: 's1', error: '502 bad gateway', replayed: true });
-  await sleep(40);
+  await sleep(280);
   assert.equal(harness.runs.length, 0);
 });
 
@@ -330,7 +371,7 @@ test('activity rpc returns logged entries', async (t) => {
     subject: { session_id: 's1' },
     summary: 'timeout',
   });
-  await sleep(40);
+  await sleep(280);
   const handler = harness.rpc.get('activity');
   assert.ok(handler);
   const result = await handler({ limit: 20 }, { identity: { userId: 7, profile: 'default' } });

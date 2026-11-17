@@ -4,6 +4,8 @@ import path from 'node:path';
 const ACTIVITY_LIMIT = 1000;
 const PENDING_TTL_MS = 60000;
 const FALLBACK_GRACE_MS = 700;
+const STOP_SUPPRESS_MS = 15000;
+const PUMP_INTERVAL_MS = 100;
 const STALE_EVENT_MS = 5 * 60 * 1000;
 const MESSAGE_LOOKUP_LIMIT = 12;
 const MESSAGE_LOOKUP_TIMEOUT_MS = 3000;
@@ -216,9 +218,16 @@ export function apply(ctx) {
   const seen = new Map();
   const pending = new Map();
   const connections = new Map();
+  const connectionQueue = [];
   const ring = [];
   let disposed = false;
+  let pumping = false;
   let writeChain = Promise.resolve();
+
+  const activationIdentity = {
+    userId: ctx.identity?.userId ?? 0,
+    profile: ctx.identity?.profile ?? 'default',
+  };
 
   const configNow = () => normalizeConfig(ctx.config);
 
@@ -282,17 +291,32 @@ export function apply(ctx) {
     return `${userId}|${profile}|${sid}`;
   };
 
-  const ensureAttempt = (key, sid, profile) => {
+  const ensureAttempt = (key, sid, profile, userId) => {
     let state = attempts.get(key);
     if (!state) {
-      state = { count: 0, lastAt: 0, timer: null, sid, profile, lastRawAt: 0, generation: 0, finishCheck: false };
+      state = {
+        count: 0,
+        lastAt: 0,
+        sid,
+        profile,
+        userId,
+        lastRawAt: 0,
+        generation: 0,
+        finishCheck: false,
+        stoppedAt: 0,
+        dueAt: 0,
+        job: null,
+        fallbackDueAt: 0,
+        fallback: null,
+        busy: false,
+      };
       attempts.set(key, state);
       if (attempts.size > 500) {
-        const oldestKey = attempts.keys().next().value;
-        const oldest = attempts.get(oldestKey);
-        if (oldest?.timer) clearTimeout(oldest.timer);
-        attempts.delete(oldestKey);
+        attempts.delete(attempts.keys().next().value);
       }
+    } else {
+      if (state.userId == null) state.userId = userId;
+      if (!state.profile) state.profile = profile;
     }
     return state;
   };
@@ -331,20 +355,28 @@ export function apply(ctx) {
     return true;
   };
 
-  const runContinuation = async ({ key, sid, action, run, kind, reason, userId }) => {
+  /** Deferred work runs from the pump created in apply(), not from the event
+   * handler: Studio aborts the handler's RunContext as soon as it returns. */
+  const runContinuation = async ({ key, job }) => {
     if (disposed) return;
+    const state = attempts.get(key);
+    if (!state) return;
+    const { sid, profile, userId } = state;
+    const { action, kind, reason } = job;
+    if (job.generation !== state.generation) {
+      record({ user_id: userId, session_id: sid, action: 'skip', kind, reason: '运行状态已变化，取消本次续跑' });
+      return;
+    }
     const config = configNow();
     if (!config.enabled) {
       record({ user_id: userId, session_id: sid, action: 'skip', reason: '插件已禁用' });
       return;
     }
-    const state = attempts.get(key);
-    if (!state) return;
     if (state.count >= config.maxAttempts) {
       record({ user_id: userId, session_id: sid, action: 'cap', attempt: state.count, reason: '达到单会话续跑上限' });
       return;
     }
-    const host = run?.host ?? ctx.host;
+    const host = ctx.host;
     let session;
     try {
       session = normalizeSession(await host.sessions.get(sid));
@@ -358,6 +390,10 @@ export function apply(ctx) {
     }
     if (isBusy(session)) {
       record({ user_id: userId, session_id: sid, action: 'skip', kind, reason: '会话仍在运行，跳过本次续跑' });
+      return;
+    }
+    if (disposed || job.generation !== state.generation) {
+      record({ user_id: userId, session_id: sid, action: 'skip', kind, reason: '运行状态已变化，取消本次续跑' });
       return;
     }
     state.count += 1;
@@ -378,7 +414,7 @@ export function apply(ctx) {
         await host.sessions.setModel(sid, model);
       }
       markPending(key);
-      const result = await host.sessions.run(sid, config.prompt, {});
+      const result = await host.sessions.run(sid, config.prompt, { profile: profile || 'default' });
       record({
         user_id: userId,
         session_id: sid,
@@ -404,12 +440,11 @@ export function apply(ctx) {
     }
   };
 
-  const schedule = ({ sid, event, kind, decision, run }) => {
+  const schedule = ({ sid, eventType, kind, decision, userId, profile }) => {
     const config = configNow();
-    const key = keyOf(sid, run);
-    const { userId, profile } = identityOf(run);
-    const state = ensureAttempt(key, sid, profile);
-    if (state.timer) {
+    const key = `${userId}|${profile || 'default'}|${sid}`;
+    const state = ensureAttempt(key, sid, profile || 'default', userId);
+    if (state.dueAt || state.busy) {
       record({ user_id: userId, session_id: sid, kind, action: 'skip', reason: '已有待执行的续跑' });
       return;
     }
@@ -421,19 +456,8 @@ export function apply(ctx) {
     const cooldownLeft = Math.max(0, (state.lastAt || 0) + config.cooldownMs - now);
     const backoff = Math.min(config.backoffMaxMs, config.backoffBaseMs * 2 ** state.count);
     const delay = Math.max(cooldownLeft, backoff);
-    state.timer = setTimeout(() => {
-      state.timer = null;
-      if (disposed) return;
-      runContinuation({
-        key,
-        sid,
-        action: decision.action,
-        run,
-        kind,
-        reason: decision.reason,
-        userId,
-      }).catch((error) => log('continuation task failed', { session_id: sid, error: errorText(error) }));
-    }, delay);
+    state.dueAt = now + delay;
+    state.job = { action: decision.action, kind, reason: decision.reason, generation: state.generation };
     record({
       user_id: userId,
       session_id: sid,
@@ -443,9 +467,24 @@ export function apply(ctx) {
       delay_ms: delay,
       reason: decision.reason,
       status: 'scheduled',
-      event: event?.type ?? '',
+      event: eventType || '',
     });
     log('continuation scheduled', { session_id: sid, kind, action: decision.action, delay_ms: delay });
+  };
+
+  const cancelPending = (state, reason, userId) => {
+    let canceled = false;
+    if (state.dueAt) {
+      state.dueAt = 0;
+      state.job = null;
+      canceled = true;
+    }
+    if (state.fallbackDueAt) {
+      state.fallbackDueAt = 0;
+      state.fallback = null;
+    }
+    if (canceled) record({ user_id: userId, session_id: state.sid, action: 'skip', reason });
+    return canceled;
   };
 
   const truncationFromMessages = async (host, sid, messageId, runId) => {
@@ -481,21 +520,28 @@ export function apply(ctx) {
 
   /** ekko-agent only exports stop_reason=length via the persisted message, so the
    * finish_reason of the final assistant row is the reliable truncation source. */
-  const resolveCompletion = async ({ key, sid, run, state, messageId, runId, event }) => {
+  const resolveCompletion = async ({ key, sid, state, messageId, runId, eventType }) => {
     const generation = state.generation;
     state.finishCheck = true;
     let truncated = false;
     try {
-      const lookup = await truncationFromMessages(run?.host ?? ctx.host, sid, messageId, runId);
+      const lookup = await truncationFromMessages(ctx.host, sid, messageId, runId);
       truncated = lookup.truncated;
     } catch (error) {
       log('completion resolution failed', { session_id: sid, error: errorText(error) });
     }
     if (disposed || attempts.get(key) !== state || state.generation !== generation) return;
     state.finishCheck = false;
-    if (state.timer) return;
+    if (state.dueAt) return;
     if (truncated) {
-      schedule({ sid, event: event ?? { type: 'session.run.completed' }, kind: 'max-tokens', decision: decide('max-tokens', configNow()), run });
+      schedule({
+        sid,
+        eventType: eventType ?? 'session.run.completed',
+        kind: 'max-tokens',
+        decision: decide('max-tokens', configNow()),
+        userId: state.userId,
+        profile: state.profile,
+      });
       return;
     }
     resetAttempt(key);
@@ -512,32 +558,39 @@ export function apply(ctx) {
     }
   };
 
-  const ensureConnection = ({ key, sid, run }) => {
-    if (disposed) return;
-    const existing = connections.get(key);
-    if (existing) return;
-    const host = run?.host ?? ctx.host;
-    if (!host?.sessions?.connect) return;
-    const entry = { status: 'connecting', sid, run, close: null };
-    connections.set(key, entry);
-    Promise.resolve()
-      .then(() => host.sessions.connect(sid, (raw) => handleRawEvent(key, raw), 'chat'))
-      .then((connection) => {
-        if (disposed || connections.get(key) !== entry) {
-          try {
-            connection?.close?.();
-          } catch {
-            // ignore
-          }
-          return;
+  const ensureConnection = ({ key, sid, userId, profile }) => {
+    if (disposed || connections.has(key)) return;
+    // The socket runs under the activation identity. A different Profile cannot
+    // join the session room and would emit a synthetic access-denied run.failed,
+    // so those sessions use business events plus persisted messages instead.
+    if ((profile || 'default') !== activationIdentity.profile) {
+      log('session transport skipped for another profile', { session_id: sid, profile });
+      return;
+    }
+    connections.set(key, { status: 'queued', sid, userId, profile, close: null });
+    connectionQueue.push(key);
+  };
+
+  const openConnection = async (key) => {
+    const entry = connections.get(key);
+    if (!entry || entry.status !== 'queued' || disposed) return;
+    entry.status = 'connecting';
+    try {
+      const connection = await ctx.host.sessions.connect(entry.sid, (raw) => handleRawEvent(key, raw), 'chat');
+      if (disposed || connections.get(key) !== entry) {
+        try {
+          connection?.close?.();
+        } catch {
+          // ignore
         }
-        entry.status = 'open';
-        entry.close = () => connection?.close?.();
-      })
-      .catch((error) => {
-        if (connections.get(key) === entry) connections.delete(key);
-        log('session transport unavailable', { session_id: sid, error: errorText(error) });
-      });
+        return;
+      }
+      entry.status = 'open';
+      entry.close = () => connection?.close?.();
+    } catch (error) {
+      if (connections.get(key) === entry) connections.delete(key);
+      log('session transport unavailable', { session_id: entry.sid, error: errorText(error) });
+    }
   };
 
   const rawTextOf = (raw) => [
@@ -555,17 +608,29 @@ export function apply(ctx) {
     if (disposed || !raw || typeof raw !== 'object') return;
     const entry = connections.get(key);
     if (!entry) return;
-    const { sid, run } = entry;
-    const { userId } = identityOf(run);
+    const { sid, userId, profile } = entry;
     if (raw.replayed === true || raw.restored === true || raw.background_snapshot === true) return;
     if (raw.event === 'transport.error' || raw.event === 'transport.disconnected') {
       closeConnection(key);
       log('session transport closed', { session_id: sid, reason: raw.event });
       return;
     }
+    if (raw.event === 'abort.completed') {
+      if (raw.ignored === true) return;
+      const aborted = ensureAttempt(key, sid, profile, userId);
+      aborted.stoppedAt = Date.now();
+      aborted.generation += 1;
+      aborted.finishCheck = false;
+      cancelPending(aborted, '用户已停止本次运行，取消待续跑', userId);
+      resetAttempt(key);
+      closeConnection(key);
+      return;
+    }
     if (raw.event !== 'run.failed' && raw.event !== 'run.completed') return;
-    const state = ensureAttempt(key, sid, entry.run?.identity?.profile ?? 'default');
+    const state = ensureAttempt(key, sid, profile, userId);
     state.lastRawAt = Date.now();
+    state.fallbackDueAt = 0;
+    state.fallback = null;
 
     if (raw.event === 'run.failed') {
       closeConnection(key);
@@ -580,7 +645,7 @@ export function apply(ctx) {
         record({ user_id: userId, session_id: sid, kind, action: 'stop', reason: decision.reason, transport: 'socket' });
         return;
       }
-      schedule({ sid, event: { type: 'session.run.failed' }, kind, decision, run });
+      schedule({ sid, eventType: 'session.run.failed', kind, decision, userId, profile });
       return;
     }
 
@@ -590,18 +655,96 @@ export function apply(ctx) {
       return;
     }
     if (isTruncated(raw)) {
-      schedule({ sid, event: { type: 'session.run.completed' }, kind: 'max-tokens', decision: decide('max-tokens', configNow()), run });
+      schedule({
+        sid,
+        eventType: 'session.run.completed',
+        kind: 'max-tokens',
+        decision: decide('max-tokens', configNow()),
+        userId,
+        profile,
+      });
       return;
     }
     resolveCompletion({
       key,
       sid,
-      run,
       state,
       messageId: raw.message_id,
       runId: raw.run_id,
-      event: { type: 'session.run.completed' },
+      eventType: 'session.run.completed',
     }).catch((error) => log('completion check failed', { session_id: sid, error: errorText(error) }));
+  };
+
+  const handleBusinessFailure = ({ key, sid, userId, profile, event }) => {
+    if (disposed) return;
+    const state = attempts.get(key);
+    if (!state || state.dueAt || state.busy) return;
+    if (state.stoppedAt && Date.now() - state.stoppedAt < STOP_SUPPRESS_MS) {
+      record({
+        user_id: userId,
+        session_id: sid,
+        action: 'skip',
+        kind: 'cancel',
+        reason: '用户已停止本次运行，不自动续跑',
+        event: event?.type ?? '',
+      });
+      return;
+    }
+    const kind = classify(haystackOf(event));
+    const decision = decide(kind, configNow());
+    if (decision.action === 'stop') {
+      record({
+        user_id: userId,
+        session_id: sid,
+        kind,
+        action: 'stop',
+        reason: decision.reason,
+        event: event?.type ?? '',
+      });
+      return;
+    }
+    schedule({ sid, eventType: event?.type ?? '', kind, decision, userId, profile });
+  };
+
+  const pump = async () => {
+    if (pumping || disposed) return;
+    pumping = true;
+    try {
+      while (connectionQueue.length && !disposed) {
+        await openConnection(connectionQueue.shift());
+      }
+      let now = Date.now();
+      for (const [key, state] of [...attempts]) {
+        if (disposed || attempts.get(key) !== state) continue;
+        if (!state.fallbackDueAt || state.fallbackDueAt > now) continue;
+        const fallback = state.fallback;
+        state.fallbackDueAt = 0;
+        state.fallback = null;
+        if (!fallback || state.dueAt || state.busy) continue;
+        if (state.lastRawAt && now - state.lastRawAt < 5000) continue;
+        if (state.stoppedAt && now - state.stoppedAt < STOP_SUPPRESS_MS) continue;
+        handleBusinessFailure(fallback);
+      }
+      now = Date.now();
+      for (const [key, state] of [...attempts]) {
+        if (disposed || attempts.get(key) !== state) continue;
+        if (!state.dueAt || state.dueAt > now || state.busy) continue;
+        const job = state.job;
+        state.dueAt = 0;
+        state.job = null;
+        if (!job) continue;
+        state.busy = true;
+        try {
+          await runContinuation({ key, job });
+        } finally {
+          state.busy = false;
+        }
+      }
+    } catch (error) {
+      log('continuation pump failed', { error: errorText(error) });
+    } finally {
+      pumping = false;
+    }
   };
 
   const onRunEvent = async (event, run, phase) => {
@@ -611,58 +754,52 @@ export function apply(ctx) {
     if (!fresh(event) || isStale(event)) return;
     const data = event?.data ?? {};
     const sid = pickSessionId(event);
+    const { userId, profile } = identityOf(run);
     if (!sid) {
-      record({ user_id: identityOf(run).userId, action: 'skip', reason: '事件缺少会话 ID', event: event?.type ?? '' });
+      record({ user_id: userId, action: 'skip', reason: '事件缺少会话 ID', event: event?.type ?? '' });
       return;
     }
     const scope = skippedScope(data);
     if (scope) {
-      record({ user_id: identityOf(run).userId, session_id: sid, action: 'skip', reason: `忽略${scope}`, event: event?.type ?? '' });
+      record({ user_id: userId, session_id: sid, action: 'skip', reason: `忽略${scope}`, event: event?.type ?? '' });
       return;
     }
     const key = keyOf(sid, run);
-    const { userId, profile } = identityOf(run);
-    const state = ensureAttempt(key, sid, profile);
+    const state = ensureAttempt(key, sid, profile, userId);
     if (phase === 'completed') {
-      if (state.timer || state.finishCheck || Date.now() - state.lastRawAt < 5000) return;
+      if (state.dueAt || state.busy || state.finishCheck || Date.now() - state.lastRawAt < 5000) return;
+      state.fallbackDueAt = 0;
+      state.fallback = null;
       if (isTruncated(data)) {
-        schedule({ sid, event, kind: 'max-tokens', decision: decide('max-tokens', config), run });
+        schedule({ sid, eventType: event?.type ?? '', kind: 'max-tokens', decision: decide('max-tokens', config), userId, profile });
         return;
       }
       const subject = data.subject ?? {};
       await resolveCompletion({
         key,
         sid,
-        run,
         state,
         messageId: data.message_id ?? subject.message_id,
         runId: subject.run_id ?? data.run_id,
-        event,
+        eventType: event?.type ?? 'chat.run.completed',
       });
       return;
     }
     // A live socket subscription carries the real error text; this business
     // event is only the fallback when that transport is not established.
-    if (state.fallbackTimer) return;
-    const delay = connections.has(key) ? FALLBACK_GRACE_MS : 0;
-    state.fallbackTimer = setTimeout(() => {
-      state.fallbackTimer = null;
-      if (disposed || state.timer || (state.lastRawAt && Date.now() - state.lastRawAt < 5000)) return;
-      const kind = classify(haystackOf(event));
-      const decision = decide(kind, configNow());
-      if (decision.action === 'stop') {
-        record({
-          user_id: userId,
-          session_id: sid,
-          kind,
-          action: 'stop',
-          reason: decision.reason,
-          event: event?.type ?? '',
-        });
-        return;
-      }
-      schedule({ sid, event, kind, decision, run });
-    }, delay);
+    if (state.fallbackDueAt || state.dueAt || state.busy) return;
+    if (state.lastRawAt && Date.now() - state.lastRawAt < 5000) return;
+    if (state.stoppedAt && Date.now() - state.stoppedAt < STOP_SUPPRESS_MS) {
+      handleBusinessFailure({ key, sid, userId, profile, event });
+      return;
+    }
+    const fallback = { key, sid, userId, profile, event };
+    if (connections.has(key)) {
+      state.fallbackDueAt = Date.now() + FALLBACK_GRACE_MS;
+      state.fallback = fallback;
+      return;
+    }
+    handleBusinessFailure(fallback);
   };
 
   const listeners = [
@@ -679,18 +816,33 @@ export function apply(ctx) {
       const data = event?.data ?? {};
       if (skippedScope(data)) return;
       const key = keyOf(sid, run);
-      const state = ensureAttempt(key, sid, identityOf(run).profile);
+      const { userId, profile } = identityOf(run);
+      const state = ensureAttempt(key, sid, profile, userId);
       state.generation += 1;
       state.finishCheck = false;
+      state.stoppedAt = 0;
+      state.fallbackDueAt = 0;
+      state.fallback = null;
       if (!consumePending(key)) {
-        if (state.timer) {
-          clearTimeout(state.timer);
-          state.timer = null;
-          record({ user_id: run?.identity?.userId, session_id: sid, action: 'skip', reason: '用户发起了新的运行，取消待执行的续跑' });
-        }
+        cancelPending(state, '用户发起了新的运行，取消待执行的续跑', userId);
         resetAttempt(key);
       }
-      ensureConnection({ key, sid, run });
+      ensureConnection({ key, sid, userId, profile });
+    }),
+    ctx.events.on('chat.run.stopped', (event, run) => {
+      if (disposed || isStale(event)) return;
+      const sid = pickSessionId(event);
+      if (!sid) return;
+      const data = event?.data ?? {};
+      if (skippedScope(data)) return;
+      const key = keyOf(sid, run);
+      const { userId, profile } = identityOf(run);
+      const state = ensureAttempt(key, sid, profile, userId);
+      state.stoppedAt = Date.now();
+      state.generation += 1;
+      state.finishCheck = false;
+      cancelPending(state, '用户已停止本次运行，取消待续跑', userId);
+      resetAttempt(key);
     }),
   ];
 
@@ -728,7 +880,7 @@ export function apply(ctx) {
       sessions.push({
         session_id: state.sid ?? key.slice(prefix.length + (state.profile?.length ?? 0) + 1),
         count: state.count,
-        pending: Boolean(state.timer),
+        pending: Boolean(state.dueAt || state.busy),
         last_at: state.lastAt || null,
       });
     }
@@ -739,13 +891,16 @@ export function apply(ctx) {
     };
   });
 
+  const pumpTimer = setInterval(() => {
+    pump().catch((error) => log('continuation pump failed', { error: errorText(error) }));
+  }, PUMP_INTERVAL_MS);
+  pumpTimer.unref?.();
+
   ctx.lifecycle.add(() => {
     disposed = true;
-    for (const state of attempts.values()) {
-      if (state.timer) clearTimeout(state.timer);
-      if (state.fallbackTimer) clearTimeout(state.fallbackTimer);
-    }
+    clearInterval(pumpTimer);
     for (const key of [...connections.keys()]) closeConnection(key);
+    connectionQueue.length = 0;
     attempts.clear();
     seen.clear();
     pending.clear();
@@ -763,5 +918,5 @@ export function apply(ctx) {
     }
   });
 
-  log('plugin activated', { config: publicConfig(configNow()) });
+  log('plugin activated', { version: ctx.plugin?.version ?? '', config: publicConfig(configNow()) });
 }

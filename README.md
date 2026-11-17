@@ -48,13 +48,21 @@
 > 本地目录安装只复制成品，不会在 Studio 启动时同步源码；修改源码后需重新安装或使用开发链接。
 > 要求 Studio 版本支持 Plugin SDK v1（0.8.x，清单 `apiVersion: 1`）。旧版本不会加载本插件。
 
+### 从 GitHub 更新已安装版本
+
+1. 在 .14 上把 `https://github.com/mhemh/ekko-continue` 拉到本地目录（或 `git pull` 已克隆的目录）。
+2. 插件中心 → 本插件 → 更新 / 重新安装，选择同一目录；插件配置和信任状态会保留。
+3. 启用后查看插件日志，`ekko-continue: plugin activated` 的 data 中 `version` 应为 `1.1.0`。
+
 ## 工作方式
 
-- 订阅 `chat.run.started` / `chat.run.failed` / `chat.run.completed` 业务事件。
+- 订阅 `chat.run.started` / `chat.run.failed` / `chat.run.completed` / `chat.run.stopped` 业务事件。
 - Studio 的业务事件投影出于安全考虑**不包含原始错误文本**，因此插件在运行开始时通过 `host.sessions.connect()` 建立该会话的实时连接，从原始 `run.failed` 载荷读取 `error`、`stop_reason`、`interrupted`、`queue_remaining` 后再判定。
-- 实时连接不可用时退回业务事件判定：仅能识别通用失败，仍会受次数上限和退避保护。
+- Studio 在事件处理函数返回后会立即中止该次调用的 RunContext，因此连接建立、退避等待和续跑发送都由 `apply()` 时创建的插件生命周期泵执行，不依赖事件处理函数的活动信号。
+- 用户停止会同时通过 `chat.run.stopped` 业务事件和 socket 的 `abort.completed` 识别，取消待执行的续跑并清零计数；停止后 15 秒内的失败事件不会再触发续跑。
+- 实时连接不可用时退回业务事件判定：仅能识别通用失败，仍会受停止抑制、次数上限和退避保护。
 - 截断判定：先读原始 `stop_reason`；ekko-agent 的完成事件不输出 `length`，因此再查询该会话最新消息的 `finish_reason`（`length` / `max_tokens` / `max_output_tokens`）确认是否被截断。
-- 发送续跑：`host.sessions.run(sessionId, prompt)`；切换模型：`host.sessions.setModel()`。
+- 发送续跑：`host.sessions.run(sessionId, prompt, { profile })`，并带上会话所属 Profile；切换模型：`host.sessions.setModel()`。
 - 活动记录写入插件数据目录的 `activity.jsonl`（超过 1 MB 轮转为 `.1`），设置页展示最近 100 条。
 
 ## 范围与限制
@@ -62,8 +70,9 @@
 - 仅处理普通聊天会话；跳过群聊、工作流、子智能体和私有 person 会话。
 - Studio 没有向插件开放真正的上下文压缩接口，因此“上下文溢出”只能切换备用模型或停止，无法执行 compact。
 - 续跑是重新发送一条消息，模型上下文会继续增长；请依靠次数上限和退避控制成本。
-- 实时连接依赖会话 socket；若该连接建立失败，用户主动停止等场景只能依据业务事件兜底判断。
-- 本版本未在 192.168.0.14 上做实机验证（无该机器的登录 / 文件访问权限），安装后请先在测试会话中确认。
+- 会话 socket 使用插件的激活身份建立，因此只有激活 Profile 的会话能拿到原始 error 文本；其他 Profile 的会话仍可续跑（发送时带上会话 Profile），但失败判定退回业务事件，只能识别通用失败。
+- 若实时连接建立失败，用户主动停止仍可依据 `chat.run.stopped` / `abort.completed` 取消续跑。
+- 1.1.0 的修复通过单元测试，尚待在 192.168.0.14 上做实机验证；更新后请先在测试会话中确认“停止不续跑”和“截断续跑”。
 
 ## 开发
 
@@ -71,7 +80,7 @@
 npm test
 ```
 
-测试使用模拟的 `ctx` 和会话连接，覆盖可重试失败、认证失败、次数上限、截断续跑、持久化 `finish_reason` 截断判定、正常完成清零、重复事件、群聊跳过、上下文切换模型、原始 socket 判定、用户取消、排队中断和活动 RPC。
+测试使用模拟的 `ctx` 和会话连接，覆盖可重试失败、认证失败、次数上限、截断续跑、持久化 `finish_reason` 截断判定、正常完成清零、重复事件、群聊跳过、上下文切换模型、原始 socket 判定、用户取消、socket abort、`chat.run.stopped` 取消、跨 Profile 续跑、排队中断和活动 RPC。
 
 ## 文件
 
