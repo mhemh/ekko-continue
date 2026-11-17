@@ -1,0 +1,115 @@
+{
+  "id": "ekko-continue",
+  "name": "Ekko Continue 自动继续",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "会话运行失败或输出被截断后，按规则自动向同一会话发送续跑提示（默认“继续”）。内置 dsh-continue 的判定规则、冷却、指数退避与单会话次数上限，并提供活动记录页面。",
+  "license": "MIT",
+  "keywords": [
+    "continue",
+    "retry",
+    "automation",
+    "session",
+    "dsh"
+  ],
+  "permissions": [
+    "events",
+    "api.read",
+    "api.write",
+    "ui"
+  ],
+  "server": "server.mjs",
+  "client": "client.mjs",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "title": "启用自动继续",
+        "description": "关闭后插件仍会记录事件，但不会发起续跑。",
+        "default": true
+      },
+      "prompt": {
+        "type": "string",
+        "title": "续跑提示词",
+        "description": "续跑时发送到会话的文本，默认“继续”。",
+        "default": "继续",
+        "minLength": 1,
+        "maxLength": 2000
+      },
+      "maxAttempts": {
+        "type": "integer",
+        "title": "单会话最大续跑次数",
+        "description": "成功完成一轮后计数清零；用户手动发起新的一轮也会清零。",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
+      },
+      "cooldownMs": {
+        "type": "integer",
+        "title": "冷却时间（毫秒）",
+        "description": "两次续跑之间的最小间隔。",
+        "default": 5000,
+        "minimum": 0,
+        "maximum": 600000
+      },
+      "backoffBaseMs": {
+        "type": "integer",
+        "title": "退避基数（毫秒）",
+        "description": "第 n 次重试等待 backoffBaseMs × 2^(n-1)，不超过退避上限。",
+        "default": 2000,
+        "minimum": 0,
+        "maximum": 600000
+      },
+      "backoffMaxMs": {
+        "type": "integer",
+        "title": "退避上限（毫秒）",
+        "description": "单次续跑等待时间上限。",
+        "default": 30000,
+        "minimum": 0,
+        "maximum": 3600000
+      },
+      "fallbackProvider": {
+        "type": "string",
+        "title": "备用模型 Provider",
+        "description": "上下文溢出时切换到该 Provider；留空则遇到上下文错误直接停止。",
+        "default": "",
+        "maxLength": 200
+      },
+      "fallbackModel": {
+        "type": "string",
+        "title": "备用模型 ID",
+        "description": "与 Provider 同时填写才会启用模型切换。",
+        "default": "",
+        "maxLength": 300
+      },
+      "fallbackApiMode": {
+        "type": "string",
+        "title": "备用模型 API 模式",
+        "description": "可选，例如 chat_completions、anthropic_messages；留空沿用会话设置。",
+        "default": "",
+        "maxLength": 100
+      }
+    }
+  },
+  "views": [
+    {
+      "id": "activity",
+      "title": "自动继续",
+      "slot": "settings",
+      "icon": "history",
+      "order": -100
+    }
+  ],
+  "navigation": {
+    "settings": [
+      {
+        "viewId": "activity",
+        "icon": "history",
+        "title": "自动继续",
+        "order": -100
+      }
+    ]
+  }
+}
