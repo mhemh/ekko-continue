@@ -803,12 +803,14 @@ export function apply(ctx) {
   };
 
   const listeners = [
-    ctx.events.on('chat.run.failed', (event, run) => {
-      onRunEvent(event, run, 'failed').catch((error) => log('run.failed handler failed', { error: errorText(error) }));
-    }),
-    ctx.events.on('chat.run.completed', (event, run) => {
-      onRunEvent(event, run, 'completed').catch((error) => log('run.completed handler failed', { error: errorText(error) }));
-    }),
+    // Returning the promise keeps the invocation RunContext alive for the
+    // persisted finish_reason lookup that runs after the handler resolves.
+    ctx.events.on('chat.run.failed', (event, run) =>
+      onRunEvent(event, run, 'failed').catch((error) => log('run.failed handler failed', { error: errorText(error) })),
+    ),
+    ctx.events.on('chat.run.completed', (event, run) =>
+      onRunEvent(event, run, 'completed').catch((error) => log('run.completed handler failed', { error: errorText(error) })),
+    ),
     ctx.events.on('chat.run.started', (event, run) => {
       if (disposed || isStale(event)) return;
       const sid = pickSessionId(event);

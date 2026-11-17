@@ -189,6 +189,23 @@ test('group chat events are ignored', async (t) => {
   assert.equal(harness.runs.length, 0);
 });
 
+test('run listeners return a promise so the invocation stays alive', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  for (const type of ['chat.run.failed', 'chat.run.completed']) {
+    const listener = harness.listeners.get(type);
+    assert.ok(listener);
+    const result = listener({
+      id: `evt-${type}`,
+      type,
+      timestamp: Date.now(),
+      data: { subject: { session_id: 's1', room_id: 'room-1' }, summary: 'timeout' },
+    }, { identity: { userId: 7, profile: 'default' } });
+    assert.ok(result && typeof result.then === 'function', `${type} listener must return a promise`);
+    await result;
+  }
+});
+
 test('context failures switch to the fallback model when configured', async (t) => {
   const harness = await setup({
     fallbackProvider: 'custom:backup',

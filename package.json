@@ -1,6 +1,6 @@
 {
   "name": "ekko-continue",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Auto-continue failed or truncated Studio sessions.",
