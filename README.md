@@ -15,6 +15,7 @@
 | 为插入排队消息而中断（queue insertion） | 停止，交给排队消息 |
 | 上下文溢出（context length…） | 配置了备用模型则切换模型后继续，否则停止 |
 | 达到最大输出 / 截断（length、max_tokens） | 继续 |
+| 任务计划已结束但仍有未完成步骤（Studio 任务卡显示“本次运行已结束，剩余步骤未完成”） | 继续 |
 | 限流、网络、超时、服务端 5xx、未知错误 | 继续 |
 
 成功完成一轮后计数清零；用户手动发起新的一轮会取消待执行的续跑并清零。自动续跑本身不会重置计数，避免绕过上限。
@@ -45,6 +46,8 @@ Hermes， Deepseek Harness
 - 用户停止会同时通过 `chat.run.stopped` 业务事件和 socket 的 `abort.completed` 识别，取消待执行的续跑并清零计数；停止后 15 秒内的失败事件不会再触发续跑。
 - 实时连接不可用时退回业务事件判定：仅能识别通用失败，仍会受停止抑制、次数上限和退避保护。
 - 截断判定：先读原始 `stop_reason`；ekko-agent 的完成事件不输出 `length`，因此再查询该会话最新消息的 `finish_reason`（`length` / `max_tokens` / `max_output_tokens`）确认是否被截断。
+- 任务计划判定：监听实时连接的 `plan.updated` 事件。当计划 `execution_state === 'ended'` 且仍有非 `completed` 步骤时，Studio 任务卡会显示“本次运行已结束，剩余步骤未完成”，插件随即按续跑规则发送提示。
+- 实时连接不可用或事件已关闭连接时，完成判定会读取消息分页返回的 `taskPlans`（与任务卡同源），按 `run_id` 匹配当前运行；匹配不到时只接受 5 分钟内更新的计划。同一 `plan_id` 的同一 revision 只触发一次续跑。
 - 发送续跑：`host.sessions.run(sessionId, prompt, { profile })`，并带上会话所属 Profile；切换模型：`host.sessions.setModel()`。
 - 活动记录写入插件数据目录的 `activity.jsonl`（超过 1 MB 轮转为 `.1`），设置页展示最近 100 条。
 
@@ -63,7 +66,7 @@ Hermes， Deepseek Harness
 npm test
 ```
 
-测试使用模拟的 `ctx` 和会话连接，覆盖可重试失败、认证失败、次数上限、截断续跑、持久化 `finish_reason` 截断判定、正常完成清零、重复事件、群聊跳过、上下文切换模型、原始 socket 判定、用户取消、socket abort、`chat.run.stopped` 取消、跨 Profile 续跑、排队中断和活动 RPC。
+测试使用模拟的 `ctx` 和会话连接，覆盖可重试失败、认证失败、次数上限、截断续跑、持久化 `finish_reason` 截断判定、正常完成清零、重复事件、群聊跳过、上下文切换模型、原始 socket 判定、用户取消、socket abort、`chat.run.stopped` 取消、跨 Profile 续跑、排队中断、任务计划未完成续跑（`plan.updated` 与持久化 `taskPlans` 两条路径）、已完成/已中断计划跳过、同一 revision 去重、过期计划忽略和活动 RPC。
 
 ## 文件
 

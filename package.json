@@ -1,9 +1,9 @@
 {
   "name": "ekko-continue",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Auto-continue failed or truncated Studio sessions.",
+  "description": "Auto-continue failed, truncated, or unfinished-plan Studio sessions.",
   "license": "MIT",
   "main": "server.mjs",
   "files": [

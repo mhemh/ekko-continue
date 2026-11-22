@@ -10,6 +10,10 @@ const STALE_EVENT_MS = 5 * 60 * 1000;
 const MESSAGE_LOOKUP_LIMIT = 12;
 const MESSAGE_LOOKUP_TIMEOUT_MS = 3000;
 const SKIP_STOP_REASONS = new Set(['queue_insertion', 'aborted', 'waiting_for_tasks']);
+const PLAN_INCOMPLETE_REASON = '本次运行已结束，剩余步骤未完成，发送续跑提示';
+/** plan.updated(ended) is emitted just before run.completed, so give the run a
+ * moment to settle before the busy check in runContinuation. */
+const PLAN_SETTLE_MS = 1500;
 
 const DEFAULTS = {
   enabled: true,
@@ -95,7 +99,37 @@ function classify(text) {
   return 'any';
 }
 
+function remainingPlanSteps(plan) {
+  const steps = Array.isArray(plan?.plan) ? plan.plan : [];
+  return steps.reduce((count, step) => count + (step?.status === 'completed' ? 0 : 1), 0);
+}
+
+/** Studio renders "本次运行已结束，剩余步骤未完成" exactly when the plan's
+ * execution_state is ended and at least one step is still open. */
+function isIncompletePlan(plan) {
+  return plan?.execution_state === 'ended' && remainingPlanSteps(plan) > 0;
+}
+
+function newestIncompletePlan(plans, runId, freshSince) {
+  if (!Array.isArray(plans)) return null;
+  let best = null;
+  for (const plan of plans) {
+    if (!isIncompletePlan(plan)) continue;
+    if (runId && String(plan.run_id ?? '') !== runId) continue;
+    if (!runId && freshSince && !(Number(plan.updated_at) >= freshSince)) continue;
+    const at = Number(plan.updated_at ?? plan.created_at ?? 0);
+    const bestAt = Number(best?.updated_at ?? best?.created_at ?? -1);
+    if (!best || at > bestAt || (at === bestAt && Number(plan.revision ?? 0) > Number(best.revision ?? 0))) {
+      best = plan;
+    }
+  }
+  return best;
+}
+
 function decide(kind, config) {
+  if (kind === 'plan-incomplete') {
+    return { action: 'continue', reason: PLAN_INCOMPLETE_REASON };
+  }
   if (kind === 'auth') {
     return { action: 'stop', reason: '认证或密钥错误，不自动重试' };
   }
@@ -309,6 +343,8 @@ export function apply(ctx) {
         fallbackDueAt: 0,
         fallback: null,
         busy: false,
+        planId: '',
+        planRevision: 0,
       };
       attempts.set(key, state);
       if (attempts.size > 500) {
@@ -319,6 +355,18 @@ export function apply(ctx) {
       if (!state.profile) state.profile = profile;
     }
     return state;
+  };
+
+  /** Connects and messages both surface the same plan revisions; only the first
+   * ended revision should trigger a continuation. */
+  const planHandled = (state, plan) => {
+    const planId = String(plan?.plan_id ?? '');
+    if (!planId) return false;
+    const revision = Number(plan?.revision ?? 0);
+    if (state.planId === planId && revision <= state.planRevision) return true;
+    state.planId = planId;
+    state.planRevision = revision;
+    return false;
   };
 
   const resetAttempt = (key) => {
@@ -440,7 +488,7 @@ export function apply(ctx) {
     }
   };
 
-  const schedule = ({ sid, eventType, kind, decision, userId, profile }) => {
+  const schedule = ({ sid, eventType, kind, decision, userId, profile, minDelayMs = 0 }) => {
     const config = configNow();
     const key = `${userId}|${profile || 'default'}|${sid}`;
     const state = ensureAttempt(key, sid, profile || 'default', userId);
@@ -455,7 +503,7 @@ export function apply(ctx) {
     const now = Date.now();
     const cooldownLeft = Math.max(0, (state.lastAt || 0) + config.cooldownMs - now);
     const backoff = Math.min(config.backoffMaxMs, config.backoffBaseMs * 2 ** state.count);
-    const delay = Math.max(cooldownLeft, backoff);
+    const delay = Math.max(cooldownLeft, backoff, minDelayMs);
     state.dueAt = now + delay;
     state.job = { action: decision.action, kind, reason: decision.reason, generation: state.generation };
     record({
@@ -487,8 +535,8 @@ export function apply(ctx) {
     return canceled;
   };
 
-  const truncationFromMessages = async (host, sid, messageId, runId) => {
-    if (!host?.sessions?.messages) return { checked: false, truncated: false };
+  const completionFromMessages = async (host, sid, messageId, runId) => {
+    if (!host?.sessions?.messages) return { checked: false, truncated: false, incomplete: null };
     let timer;
     try {
       const timeout = new Promise((_, reject) => {
@@ -500,6 +548,8 @@ export function apply(ctx) {
       ]);
       const messages = Array.isArray(result?.messages) ? result.messages
         : Array.isArray(result?.data?.messages) ? result.data.messages : [];
+      const plans = Array.isArray(result?.taskPlans) ? result.taskPlans
+        : Array.isArray(result?.data?.taskPlans) ? result.data.taskPlans : [];
       const assistants = messages.filter((message) => message?.role === 'assistant');
       const wantedId = messageId == null ? '' : String(messageId);
       const wantedRun = runId == null ? '' : String(runId);
@@ -507,38 +557,52 @@ export function apply(ctx) {
         || (wantedRun && [...assistants].reverse().find((message) => String(message?.run_marker ?? message?.runMarker ?? '') === wantedRun))
         || [...assistants].reverse().find((message) => finishReasonOf(message))
         || null;
-      if (!row) return { checked: false, truncated: false };
+      const planRun = wantedRun || String(row?.run_marker ?? row?.runMarker ?? '');
+      const incomplete = (planRun ? newestIncompletePlan(plans, planRun) : null)
+        || newestIncompletePlan(plans, '', Date.now() - STALE_EVENT_MS);
+      if (!row) return { checked: false, truncated: false, incomplete };
       const reason = finishReasonOf(row);
-      return { checked: Boolean(reason), truncated: isTruncatedFinish(reason) };
+      return { checked: Boolean(reason), truncated: isTruncatedFinish(reason), incomplete };
     } catch (error) {
-      log('completion finish_reason lookup failed', { session_id: sid, error: errorText(error) });
-      return { checked: false, truncated: false };
+      log('completion message lookup failed', { session_id: sid, error: errorText(error) });
+      return { checked: false, truncated: false, incomplete: null };
     } finally {
       if (timer) clearTimeout(timer);
     }
   };
 
   /** ekko-agent only exports stop_reason=length via the persisted message, so the
-   * finish_reason of the final assistant row is the reliable truncation source. */
+   * finish_reason of the final assistant row is the reliable truncation source.
+   * The same page carries taskPlans, whose ended state exposes leftover steps. */
   const resolveCompletion = async ({ key, sid, state, messageId, runId, eventType }) => {
     const generation = state.generation;
     state.finishCheck = true;
-    let truncated = false;
+    let lookup = { checked: false, truncated: false, incomplete: null };
     try {
-      const lookup = await truncationFromMessages(ctx.host, sid, messageId, runId);
-      truncated = lookup.truncated;
+      lookup = await completionFromMessages(ctx.host, sid, messageId, runId);
     } catch (error) {
       log('completion resolution failed', { session_id: sid, error: errorText(error) });
     }
     if (disposed || attempts.get(key) !== state || state.generation !== generation) return;
     state.finishCheck = false;
     if (state.dueAt) return;
-    if (truncated) {
+    if (lookup.truncated) {
       schedule({
         sid,
         eventType: eventType ?? 'session.run.completed',
         kind: 'max-tokens',
         decision: decide('max-tokens', configNow()),
+        userId: state.userId,
+        profile: state.profile,
+      });
+      return;
+    }
+    if (lookup.incomplete && !planHandled(state, lookup.incomplete)) {
+      schedule({
+        sid,
+        eventType: eventType ?? 'session.run.completed',
+        kind: 'plan-incomplete',
+        decision: decide('plan-incomplete', configNow()),
         userId: state.userId,
         profile: state.profile,
       });
@@ -624,6 +688,23 @@ export function apply(ctx) {
       cancelPending(aborted, '用户已停止本次运行，取消待续跑', userId);
       resetAttempt(key);
       closeConnection(key);
+      return;
+    }
+    if (raw.event === 'plan.updated') {
+      if (!isIncompletePlan(raw)) return;
+      const planState = ensureAttempt(key, sid, profile, userId);
+      if (planHandled(planState, raw)) return;
+      if (planState.dueAt || planState.busy) return;
+      if (planState.stoppedAt && Date.now() - planState.stoppedAt < STOP_SUPPRESS_MS) return;
+      schedule({
+        sid,
+        eventType: 'session.plan.updated',
+        kind: 'plan-incomplete',
+        decision: decide('plan-incomplete', configNow()),
+        userId,
+        profile,
+        minDelayMs: PLAN_SETTLE_MS,
+      });
       return;
     }
     if (raw.event !== 'run.failed' && raw.event !== 'run.completed') return;

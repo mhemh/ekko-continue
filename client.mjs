@@ -74,7 +74,7 @@ export function mount(element, ctx) {
   element.append(style, root);
 
   const title = h('h2', null, '自动继续');
-  const sub = h('p', 'ekc-sub', '会话失败或输出被截断后，按规则向同一会话发送续跑提示。配置在插件中心的本插件配置中修改。');
+  const sub = h('p', 'ekc-sub', '会话失败、输出被截断，或任务计划结束但仍有未完成步骤时，按规则向同一会话发送续跑提示。配置在插件中心的本插件配置中修改。');
   root.append(title, sub);
 
   const cards = h('div', 'ekc-cards');
@@ -83,7 +83,7 @@ export function mount(element, ctx) {
   const ruleCard = h('div', 'ekc-card');
   stateCard.append(h('span', null, '运行状态'), h('b', null, '读取中'));
   attemptCard.append(h('span', null, '待续跑会话'), h('b', null, '0'));
-  ruleCard.append(h('span', null, '规则'), h('b', null, '失败续跑 / 上限停止'));
+  ruleCard.append(h('span', null, '规则'), h('b', null, '失败 / 计划未完成续跑'));
   cards.append(stateCard, attemptCard, ruleCard);
   root.append(cards);
 

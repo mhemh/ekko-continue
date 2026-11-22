@@ -6,12 +6,15 @@ import path from 'node:path';
 import { apply } from '../server.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// plan.updated(ended) fires before run.completed, so the plugin settles it first.
+const PLAN_SETTLE = 1700;
 
 async function setup(config = {}) {
   const listeners = new Map();
   const runs = [];
   const models = [];
   const messageRows = [];
+  const taskPlans = [];
   const rpc = new Map();
   const connections = [];
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ekko-continue-'));
@@ -58,13 +61,14 @@ async function setup(config = {}) {
           const offset = Number(query.offset) || 0;
           const rows = messageRows.filter((row) => row.session_id === id);
           const window = rows.slice(Math.max(0, rows.length - offset - limit), rows.length - offset);
-          return { messages: window, total: rows.length, offset, limit, hasMore: offset + window.length < rows.length };
+          const plans = taskPlans.filter((plan) => plan.session_id === id);
+          return { messages: window, taskPlans: plans, total: rows.length, offset, limit, hasMore: offset + window.length < rows.length };
         },
       },
     },
   };
   apply(ctx);
-  return { ctx, listeners, runs, models, messageRows, rpc, dir, connections };
+  return { ctx, listeners, runs, models, messageRows, taskPlans, rpc, dir, connections };
 }
 
 async function emit(listeners, type, data, options = {}) {
@@ -370,6 +374,130 @@ test('business completion falls back to the persisted finish_reason', async (t) 
   });
   await sleep(280);
   assert.equal(harness.runs.length, 1);
+});
+
+function planSnapshot(overrides = {}) {
+  const now = Date.now();
+  return {
+    session_id: 's1',
+    plan_id: 'plan-1',
+    run_id: 'run-1',
+    revision: 1,
+    execution_state: 'ended',
+    created_at: now - 1000,
+    updated_at: now,
+    plan: [
+      { id: 'a', step: 'first step', status: 'completed' },
+      { id: 'b', step: 'second step', status: 'pending' },
+    ],
+    ...overrides,
+  };
+}
+
+test('ended task plan with remaining steps continues', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  const connection = await connectSession(harness);
+  connection.listener({ event: 'plan.updated', ...planSnapshot() });
+  await sleep(PLAN_SETTLE);
+  assert.equal(harness.runs.length, 1);
+  assert.equal(harness.runs[0].input, '继续');
+});
+
+test('ended task plan with every step completed does not continue', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  const connection = await connectSession(harness);
+  connection.listener({
+    event: 'plan.updated',
+    ...planSnapshot({
+      plan: [
+        { id: 'a', step: 'first step', status: 'completed' },
+        { id: 'b', step: 'second step', status: 'completed' },
+      ],
+    }),
+  });
+  await sleep(PLAN_SETTLE);
+  assert.equal(harness.runs.length, 0);
+});
+
+test('interrupted task plans do not continue', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  const connection = await connectSession(harness);
+  connection.listener({ event: 'plan.updated', ...planSnapshot({ execution_state: 'interrupted' }) });
+  await sleep(PLAN_SETTLE);
+  assert.equal(harness.runs.length, 0);
+});
+
+test('the same plan revision only continues once', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  const connection = await connectSession(harness);
+  const plan = planSnapshot();
+  connection.listener({ event: 'plan.updated', ...plan });
+  await sleep(300);
+  connection.listener({ event: 'plan.updated', ...plan, updated_at: plan.updated_at + 5 });
+  await sleep(PLAN_SETTLE);
+  assert.equal(harness.runs.length, 1);
+});
+
+test('the follow-up completion event does not duplicate a plan trigger', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  const connection = await connectSession(harness);
+  connection.listener({ event: 'plan.updated', ...planSnapshot() });
+  await sleep(300);
+  await emit(harness.listeners, 'chat.run.completed', {
+    subject: { session_id: 's1' },
+    state: { finish_reason: 'stop' },
+  });
+  await sleep(PLAN_SETTLE);
+  assert.equal(harness.runs.length, 1);
+});
+
+test('business completion continues when the persisted plan has remaining steps', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  harness.messageRows.push({
+    id: 11,
+    session_id: 's1',
+    role: 'assistant',
+    content: 'partial answer',
+    finish_reason: 'stop',
+    run_marker: 'run-11',
+  });
+  harness.taskPlans.push(planSnapshot({ plan_id: 'plan-11', run_id: 'run-11', revision: 4 }));
+  await emit(harness.listeners, 'chat.run.completed', {
+    subject: { session_id: 's1', message_id: 11, run_id: 'run-11' },
+    state: { finish_reason: 'stop' },
+  });
+  await sleep(280);
+  assert.equal(harness.runs.length, 1);
+});
+
+test('stale task plans from another run do not continue', async (t) => {
+  const harness = await setup();
+  t.after(() => fs.rm(harness.dir, { recursive: true, force: true }));
+  harness.messageRows.push({
+    id: 12,
+    session_id: 's1',
+    role: 'assistant',
+    content: 'done',
+    finish_reason: 'stop',
+    run_marker: 'run-12',
+  });
+  harness.taskPlans.push(planSnapshot({
+    plan_id: 'plan-old',
+    run_id: 'run-old',
+    updated_at: Date.now() - 10 * 60 * 1000,
+  }));
+  await emit(harness.listeners, 'chat.run.completed', {
+    subject: { session_id: 's1', message_id: 12, run_id: 'run-12' },
+    state: { finish_reason: 'stop' },
+  });
+  await sleep(280);
+  assert.equal(harness.runs.length, 0);
 });
 
 test('replayed socket events are ignored', async (t) => {
